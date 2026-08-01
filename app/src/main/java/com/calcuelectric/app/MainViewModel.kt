@@ -1,18 +1,14 @@
 package com.calcuelectric.app
 
 import android.app.Application
+import android.content.Context
+import androidx.core.content.edit
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.calcuelectric.app.network.NetworkModule
 import com.google.gson.Gson
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.util.Locale
 
@@ -20,6 +16,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val db = AppDatabase.getDatabase(application)
     private val dao = db.appDao()
     private val gson = Gson()
+    private val prefs = application.getSharedPreferences("calcuelectric_prefs", Context.MODE_PRIVATE)
 
     private val _uiState = MutableStateFlow(UiState())
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
@@ -34,7 +31,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val users = entities.map { 
                     User(it.id, it.name, it.email, it.role, it.operationsCount) 
                 }
-                _uiState.value = _uiState.value.copy(users = users)
+                _uiState.update { it.copy(users = users) }
             }
         }
 
@@ -61,20 +58,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             dao.getUserById(userId).collectLatest { entity ->
                 if (entity != null) {
                     val updatedUser = User(entity.id, entity.name, entity.email, entity.role, entity.operationsCount)
-                    val currentState = _uiState.value
-                    
-                    if (currentState.user != updatedUser) {
-                        val roleChanged = currentState.user?.role != updatedUser.role
-                        _uiState.value = currentState.copy(user = updatedUser)
-                        
-                        if (roleChanged) {
-                            // Si cambió a admin, cargamos datos de profesor
-                            if (updatedUser.role == "admin") {
+                    _uiState.update { state ->
+                        if (state.user != updatedUser) {
+                            val roleChanged = state.user?.role != updatedUser.role
+                            if (roleChanged && updatedUser.role == "admin") {
                                 refreshAdminData()
                             }
-                            // Re-observar operaciones con la nueva lógica de rol
-                            observeOperations(if (updatedUser.role == "admin") _uiState.value.selectedStudentId else updatedUser.id)
+                            state.copy(user = updatedUser)
+                        } else {
+                            state
                         }
+                    }
+                    
+                    // Asegurar que las operaciones se observen correctamente según el rol
+                    if (updatedUser.role == "admin") {
+                        observeOperations(_uiState.value.selectedStudentId)
+                    } else {
+                        observeOperations(updatedUser.id)
                     }
                 }
             }
@@ -84,7 +84,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun refreshAdminData() {
         viewModelScope.launch {
             try {
-                // Descargar todos los usuarios (estudiantes)
+                // Descargar todos los usuarios (estudiantes) del sistema
                 val usersResponse = NetworkModule.apiService.getUsers()
                 val remoteUsers = usersResponse.body()?.users ?: emptyList()
                 if (remoteUsers.isNotEmpty()) {
@@ -93,7 +93,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     })
                 }
                 
-                // Cargar todas las operaciones para el profesor
+                // Cargar todas las operaciones globales para el profesor
                 val opsResponse = NetworkModule.apiService.getOperations()
                 val ops = opsResponse.body()?.operations ?: emptyList()
                 if (ops.isNotEmpty()) {
@@ -120,13 +120,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val operations = entities.map { 
                     Operation(it.id, it.userId, it.label, it.result, it.formulaLabel, it.studentName, it.createdAt) 
                 }
-                _uiState.value = _uiState.value.copy(operations = operations)
+                _uiState.update { it.copy(operations = operations) }
             }
         }
     }
 
     fun selectStudent(studentId: Int?) {
-        _uiState.value = _uiState.value.copy(selectedStudentId = studentId)
+        _uiState.update { it.copy(selectedStudentId = studentId) }
         val user = _uiState.value.user
         if (user != null) {
             observeOperations(if (user.role == "admin") studentId else user.id)
@@ -134,7 +134,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refresh() {
-        _uiState.value = _uiState.value.copy(isLoading = true, toastMessage = "")
+        _uiState.update { it.copy(isLoading = true, toastMessage = "") }
         viewModelScope.launch {
             try {
                 val sessionResponse = NetworkModule.apiService.getSession()
@@ -151,44 +151,60 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun tryLocalLogin(message: String = "") {
-        val localUsers = dao.getAllUsers().first()
-        if (localUsers.isNotEmpty()) {
-            val entity = localUsers.first()
-            val user = User(entity.id, entity.name, entity.email, entity.role, entity.operationsCount)
-            _uiState.value = _uiState.value.copy(isLoading = false, user = user, toastMessage = message)
-            observeOperations(if (user.role == "admin") _uiState.value.selectedStudentId else user.id)
-        } else {
-            _uiState.value = _uiState.value.copy(isLoading = false)
+        val lastId = getLastUserId()
+        if (lastId != null) {
+            val entity = dao.getUserById(lastId).first()
+            if (entity != null) {
+                val user = User(entity.id, entity.name, entity.email, entity.role, entity.operationsCount)
+                _uiState.update { it.copy(isLoading = false, user = user, toastMessage = message) }
+                observeOperations(if (user.role == "admin") _uiState.value.selectedStudentId else user.id)
+                return
+            }
+        }
+        _uiState.update { it.copy(isLoading = false) }
+    }
+
+    private fun saveUserId(id: Int?) {
+        prefs.edit {
+            if (id == null) remove("last_user_id")
+            else putInt("last_user_id", id)
         }
     }
 
+    private fun getLastUserId(): Int? {
+        val id = prefs.getInt("last_user_id", -1)
+        return if (id == -1) null else id
+    }
+
     fun toggleAuthMode() {
-        _uiState.value = _uiState.value.copy(
-            authMode = if (_uiState.value.authMode == AuthMode.Login) AuthMode.Register else AuthMode.Login,
+        _uiState.update { it.copy(
+            authMode = if (it.authMode == AuthMode.Login) AuthMode.Register else AuthMode.Login,
             toastMessage = ""
-        )
+        ) }
     }
 
     fun onEmailChange(value: String) {
-        _uiState.value = _uiState.value.copy(authEmail = value)
+        _uiState.update { it.copy(authEmail = value) }
     }
 
     fun onPasswordChange(value: String) {
-        _uiState.value = _uiState.value.copy(authPassword = value)
+        _uiState.update { it.copy(authPassword = value) }
     }
 
     fun onNameChange(value: String) {
-        _uiState.value = _uiState.value.copy(authName = value)
+        _uiState.update { it.copy(authName = value) }
     }
 
     fun onFormulaSelected(formula: String) {
-        _uiState.value = _uiState.value.copy(selectedFormula = formula)
+        _uiState.update { it.copy(selectedFormula = formula) }
     }
 
     fun onInputChanged(key: String, value: String) {
-        val newInputs = _uiState.value.inputs.toMutableMap()
-        newInputs[key] = value
-        _uiState.value = _uiState.value.copy(inputs = newInputs)
+        _uiState.update { state ->
+            val newInputs = state.inputs.toMutableMap()
+            newInputs[key] = value
+            state.copy(inputs = newInputs)
+        }
     }
 
     fun authenticate(asProfessor: Boolean = false) {
@@ -206,15 +222,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             payload["action"] = "login"
         }
 
-        _uiState.value = state.copy(isLoading = true, toastMessage = "")
+        _uiState.update { it.copy(isLoading = true, toastMessage = "") }
         viewModelScope.launch {
             try {
                 val response = NetworkModule.apiService.login(payload)
-                if (response.isSuccessful && response.body()?.user != null) {
-                    val userFromServer = response.body()!!.user!!
-                    // Si el usuario eligió entrar como profesor, forzamos el rol admin localmente
-                    val userToLoad = if (asProfessor) userFromServer.copy(role = "admin") else userFromServer
-                    loadData(userToLoad)
+                if (response.isSuccessful) {
+                    val userFromServer = response.body()?.user
+                    if (userFromServer != null) {
+                        // Forzar el rol de admin si se usó el botón de profesor
+                        val userToLoad = if (asProfessor) userFromServer.copy(role = "admin") else userFromServer
+                        
+                        // Guardar ID para auto-login futuro
+                        saveUserId(userToLoad.id)
+                        
+                        // Guardar en Room inmediatamente para persistencia del rol
+                        dao.insertUser(UserEntity(
+                            id = userToLoad.id,
+                            name = userToLoad.name,
+                            email = userToLoad.email,
+                            role = userToLoad.role,
+                            operationsCount = userToLoad.operationsCount ?: 0
+                        ))
+                        
+                        // Cargar datos completos (esto actualizará el estado de la UI)
+                        loadData(userToLoad)
+                    } else {
+                        _uiState.update { it.copy(isLoading = false, toastMessage = "Respuesta inválida del servidor") }
+                    }
                 } else {
                     val errorMsg = try {
                         val errorBody = response.errorBody()?.string()
@@ -223,10 +257,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     } catch (e: Exception) {
                         "Error en la respuesta del servidor"
                     }
-                    _uiState.value = state.copy(isLoading = false, toastMessage = errorMsg)
+                    _uiState.update { it.copy(isLoading = false, toastMessage = errorMsg) }
                 }
             } catch (e: Exception) {
-                _uiState.value = state.copy(isLoading = false, toastMessage = "Error de conexión")
+                _uiState.update { it.copy(isLoading = false, toastMessage = "Error de conexión") }
             }
         }
     }
@@ -246,7 +280,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             else -> "Resistencias en serie"
         }
 
-        _uiState.value = state.copy(resultText = result, formulaMessage = formulaMessage)
+        _uiState.update { it.copy(resultText = result, formulaMessage = formulaMessage) }
         if (result.any { it.isDigit() } && !result.startsWith("Completa")) {
             saveOperation(result, formulaMessage)
         }
@@ -254,18 +288,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun loadData(user: User) {
         try {
-            // Verificar si el usuario ya es admin en la base de datos local para no sobrescribir su rol
+            // Lógica de rol: Admin prevalece si está en DB o si viene forzado por el botón de login
             val localUser = dao.getUserById(user.id).first()
-            val finalRole = if (localUser?.role == "admin") "admin" else user.role
+            val finalRole = when {
+                user.role == "admin" -> "admin"
+                localUser?.role == "admin" -> "admin"
+                else -> user.role
+            }
             val userToSave = user.copy(role = finalRole)
 
-            // Guardar usuario en la base de datos local
+            // Persistir ID y datos del usuario
+            saveUserId(userToSave.id)
             dao.insertUser(UserEntity(userToSave.id, userToSave.name, userToSave.email, userToSave.role, userToSave.operationsCount ?: 0))
 
             if (userToSave.role == "admin") {
                 refreshAdminData()
             } else {
-                // Cargar operaciones del estudiante
+                // Cargar operaciones solo del estudiante
                 val opsResponse = NetworkModule.apiService.getOperations()
                 val ops = opsResponse.body()?.operations ?: emptyList()
                 dao.insertOperations(ops.map { 
@@ -273,10 +312,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 })
             }
 
-            _uiState.value = _uiState.value.copy(isLoading = false, user = userToSave)
+            _uiState.update { it.copy(isLoading = false, user = userToSave) }
             observeOperations(if (userToSave.role == "admin") _uiState.value.selectedStudentId else userToSave.id)
         } catch (e: Exception) {
-            _uiState.value = _uiState.value.copy(isLoading = false, user = user, toastMessage = "Sincronizado localmente")
+            _uiState.update { it.copy(isLoading = false, user = user, toastMessage = "Sincronizado localmente") }
             observeOperations(if (user.role == "admin") _uiState.value.selectedStudentId else user.id)
         }
     }
@@ -287,15 +326,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 NetworkModule.apiService.login(mapOf("action" to "logout")) 
             } catch (_: Exception) {}
             
-            // Mantenemos los usuarios en DB, solo reseteamos el estado actual
-            _uiState.value = UiState(isLoading = false, user = null, toastMessage = "Sesión cerrada")
+            saveUserId(null)
+            _uiState.update { UiState(isLoading = false, user = null, toastMessage = "Sesión cerrada") }
             operationsJob?.cancel()
             currentUserJob?.cancel()
         }
     }
 
     fun startEditing(operation: Operation) {
-        _uiState.value = _uiState.value.copy(editingOperationId = operation.id, editLabel = operation.label, editResult = operation.result)
+        _uiState.update { it.copy(editingOperationId = operation.id, editLabel = operation.label, editResult = operation.result) }
     }
 
     fun deleteOperation(id: Int) {
@@ -304,17 +343,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 NetworkModule.apiService.deleteOperation(mapOf("id" to id))
                 dao.deleteOperationById(id)
             } catch (e: Exception) {
-                _uiState.value = _uiState.value.copy(toastMessage = "Error al eliminar")
+                _uiState.update { it.copy(toastMessage = "Error al eliminar") }
             }
         }
     }
 
     fun onEditLabelChanged(value: String) {
-        _uiState.value = _uiState.value.copy(editLabel = value)
+        _uiState.update { it.copy(editLabel = value) }
     }
 
     fun onEditResultChanged(value: String) {
-        _uiState.value = _uiState.value.copy(editResult = value)
+        _uiState.update { it.copy(editResult = value) }
     }
 
     fun saveEditedOperation() {
@@ -326,16 +365,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val updated = res.body()?.operation
                 if (updated != null) {
                     dao.insertOperation(OperationEntity(id = updated.id, userId = updated.userId, label = updated.label, result = updated.result, formulaLabel = updated.formulaLabel, studentName = updated.studentName, createdAt = updated.createdAt))
-                    _uiState.value = state.copy(editingOperationId = null, toastMessage = "Actualizado")
+                    _uiState.update { it.copy(editingOperationId = null, toastMessage = "Actualizado") }
                 }
             } catch (e: Exception) {
-                _uiState.value = state.copy(toastMessage = "Error al actualizar")
+                _uiState.update { it.copy(toastMessage = "Error al actualizar") }
             }
         }
     }
 
     fun cancelEditing() {
-        _uiState.value = _uiState.value.copy(editingOperationId = null)
+        _uiState.update { it.copy(editingOperationId = null) }
     }
 
     private fun calculateOhm(inputs: Map<String, String>): String {
